@@ -3622,8 +3622,24 @@ tgBot.command('broadcast', async (ctx) => {
 });
 
 // =============== START ===============
+async function startTelegramWithRetry(retries = 5, delayMs = 5000) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            await tgBot.launch();
+            console.log("✅ Telegram bot connected");
+            return;
+        } catch (err) {
+            console.error(`⚠️ Telegram launch attempt ${attempt}/${retries} failed:`, err.code || err.message);
+            if (attempt < retries) {
+                await wait(delayMs);
+            }
+        }
+    }
+    console.error("❌ Telegram bot could not connect after retries; WhatsApp bot remains active.");
+}
+
 restoreSessions();
-tgBot.launch();
+startTelegramWithRetry();
 console.log('Godstrike Bot running...');
 
 process.on('uncaughtException', console.error);
