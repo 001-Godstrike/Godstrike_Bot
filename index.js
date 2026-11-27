@@ -1384,47 +1384,64 @@ case 'viewonce': {
     reply('Decrypting view-once media...');
 
     try {
-        const sourceMsg = {
+        let targetContent = unwrappedQuoted;
+        let targetMedia = mediaMsg;
+        let sourceMsg = {
             key: {
                 remoteJid: jid,
                 fromMe: isQuotedFromMe(sock, contextInfo),
                 id: contextInfo.stanzaId,
                 participant: contextInfo.participant || jid
             },
-            message: unwrappedQuoted
+            message: targetContent
         };
+
+        if (!targetMedia.url && !targetMedia.directPath && typeof sock.updateMediaMessage === 'function') {
+            try {
+                const refreshed = await sock.updateMediaMessage(sourceMsg);
+                const refreshedUnwrapped = unwrapViewOnceMessage(refreshed?.message || refreshed);
+                if (refreshedUnwrapped.mediaMsg?.url || refreshedUnwrapped.mediaMsg?.directPath) {
+                    targetContent = refreshedUnwrapped.content;
+                    targetMedia = refreshedUnwrapped.mediaMsg;
+                    sourceMsg = {
+                        ...sourceMsg,
+                        message: targetContent
+                    };
+                }
+            } catch {}
+        }
+
+        if (!targetMedia.url && !targetMedia.directPath) {
+            return reply('Failed to decrypt: WhatsApp did not include a media URL or directPath (it may already be opened or expired).');
+        }
 
         const buffer = await downloadMediaMessage(
             sourceMsg,
             'buffer',
-            {},
-            {
-                reuploadRequest: sock.updateMediaMessage,
-                logger: pino({ level: 'silent' })
-            }
+            { reuploadRequest: sock.updateMediaMessage },
+            { logger: pino({ level: 'silent' }) }
         );
 
         if (!buffer) return reply('Failed to decrypt view-once media.');
 
-        const origCaption = mediaMsg.caption ? `\n\n${mediaMsg.caption}` : '';
+        const origCaption = targetMedia.caption ? `\n\n${targetMedia.caption}` : '';
 
-        // Determine media type and send accordingly
-        if (unwrappedQuoted?.imageMessage) {
+        if (targetContent?.imageMessage) {
             await sock.sendMessage(jid, {
                 image: buffer,
                 caption: `📸 View-Once image decrypted${origCaption}`
             }, { quoted: msg });
-        } else if (unwrappedQuoted?.videoMessage) {
+        } else if (targetContent?.videoMessage) {
             await sock.sendMessage(jid, {
                 video: buffer,
                 caption: `🎥 View-Once video decrypted${origCaption}`,
-                mimetype: unwrappedQuoted.videoMessage.mimetype || 'video/mp4'
+                mimetype: targetContent.videoMessage.mimetype || 'video/mp4'
             }, { quoted: msg });
-        } else if (unwrappedQuoted?.audioMessage) {
-            const isPtt = unwrappedQuoted.audioMessage.ptt === true;
+        } else if (targetContent?.audioMessage) {
+            const isPtt = targetContent.audioMessage.ptt === true;
             await sock.sendMessage(jid, {
                 audio: buffer,
-                mimetype: unwrappedQuoted.audioMessage.mimetype || (isPtt ? 'audio/ogg; codecs=opus' : 'audio/mpeg'),
+                mimetype: targetContent.audioMessage.mimetype || (isPtt ? 'audio/ogg; codecs=opus' : 'audio/mpeg'),
                 ptt: isPtt
             }, { quoted: msg });
         }
