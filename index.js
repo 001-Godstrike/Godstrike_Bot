@@ -10,7 +10,8 @@ const {
     fetchLatestBaileysVersion,
     DisconnectReason,
     jidDecode,
-    downloadMediaMessage
+    downloadMediaMessage,
+    normalizeMessageContent
 } = require('@whiskeysockets/baileys');
 
 const { Telegraf } = require('telegraf');
@@ -23,20 +24,55 @@ const mathjs = require('mathjs');
 const translate = require('@vitalets/google-translate-api');
 const sharp = require('sharp');
 const ffmpeg = require('fluent-ffmpeg');
-ffmpeg.setFfmpegPath('./lib/fluent-ffmpeg');
+if (process.env.FFMPEG_PATH) {
+    ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH);
+}
 
 
-const { writeFile, unlink, rmdir } = require('fs/promises');
+const { writeFile, unlink, rm } = require('fs/promises');
+const { execFile } = require('child_process');
+
+// Load .env without external dependencies (Node 20.12+ or fallback parser)
+function loadEnvFile(envPath = path.join(__dirname, '.env')) {
+    if (!fs.existsSync(envPath)) return;
+    if (typeof process.loadEnvFile === 'function') {
+        process.loadEnvFile(envPath);
+        return;
+    }
+    const lines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx === -1) continue;
+        const key = trimmed.slice(0, eqIdx).trim();
+        let val = trimmed.slice(eqIdx + 1).trim();
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+            val = val.slice(1, -1);
+        }
+        if (!(key in process.env)) process.env[key] = val;
+    }
+}
+loadEnvFile();
 
 // =============== CONFIG ===============
-const TELEGRAM_TOKEN = '8275614652:AAFWihaXLJxSwRNHSqu1iuZ8N8A7Ijmphi0';
-const GROQ_KEY = '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';
-const SUPREME_OWNER = '127535362920502';       // your LID (the number from .id output)
-const SUPREME_TELEGRAM_ID = 7417750937;         // your Telegram user ID for admin commands
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const GROQ_KEY = process.env.GROQ_KEY;
+const SUPREME_OWNER = process.env.SUPREME_OWNER || '';
+const SUPREME_TELEGRAM_ID = Number(process.env.SUPREME_TELEGRAM_ID || 0);
+const MALVRYX_API_KEY = process.env.MALVRYX_API_KEY || '';
+const YOUTUBE_COOKIE = process.env.YOUTUBE_COOKIE || '';
 const DEFAULT_PREFIX = '.';
 const SESSION_DIR = './sessions';
 const DEFAULT_OWNER_NAME = 'Godstrike';
 const DEFAULT_BOT_NAME = 'GODSTRIKEBOT 2.0';
+
+if (!TELEGRAM_TOKEN) {
+    throw new Error('Missing TELEGRAM_TOKEN environment variable. Set it in .env.');
+}
+if (!GROQ_KEY) {
+    throw new Error('Missing GROQ_KEY environment variable. Set it in .env.');
+}
 
 // =============== INIT APIs ===============
 const tgBot = new Telegraf(TELEGRAM_TOKEN);
@@ -66,6 +102,109 @@ const decodeJidSafe = (id) => {
 };
 
 const cleanNumber = (jid) => String(jid).replace(/[^0-9]/g, '');
+
+function matchesParticipant(participant, ...targets) {
+    if (!participant) return false;
+    const candidateNums = [participant.id, participant.lid, participant.phoneNumber]
+        .filter(Boolean)
+        .map(cleanNumber);
+    const targetNums = targets.filter(Boolean).map(cleanNumber);
+    return targetNums.some(t => t && candidateNums.includes(t));
+}
+
+function isParticipantAdmin(participant) {
+    return Boolean(
+        participant &&
+        (participant.admin === 'admin' ||
+         participant.admin === 'superadmin' ||
+         participant.isAdmin ||
+         participant.isSuperAdmin)
+    );
+}
+
+const SAFE_MATH_FUNCTIONS = new Set([
+    'abs', 'acos', 'asin', 'atan', 'atan2', 'cbrt', 'ceil', 'cos', 'cosh',
+    'exp', 'floor', 'hypot', 'log', 'log10', 'log2', 'max', 'min', 'mod',
+    'nthRoot', 'pow', 'round', 'sign', 'sin', 'sinh', 'sqrt', 'tan', 'tanh', 'trunc'
+]);
+const SAFE_MATH_SYMBOLS = new Set(['e', 'pi', 'tau', 'phi', 'E', 'PI']);
+
+function safeMathEvaluate(expr) {
+    if (!expr || expr.length > 200) {
+        throw new Error('Expression too long or empty');
+    }
+    const node = mathjs.parse(expr);
+    let nodeCount = 0;
+    node.traverse((n) => {
+        nodeCount++;
+        if (nodeCount > 100) throw new Error('Expression too complex');
+        const type = n.type;
+        if (type === 'ConstantNode' || type === 'OperatorNode' || type === 'ParenthesisNode') {
+            return;
+        }
+        if (type === 'FunctionNode') {
+            const fnName = n.fn && n.fn.name;
+            if (!SAFE_MATH_FUNCTIONS.has(fnName)) {
+                throw new Error(`Disallowed function: ${fnName}`);
+            }
+            return;
+        }
+        if (type === 'SymbolNode') {
+            if (!SAFE_MATH_SYMBOLS.has(n.name) && !SAFE_MATH_FUNCTIONS.has(n.name)) {
+                throw new Error(`Disallowed symbol: ${n.name}`);
+            }
+            return;
+        }
+        throw new Error(`Disallowed expression node: ${type}`);
+    });
+    return node.compile().evaluate({});
+}
+
+function extractContextInfo(content) {
+    if (!content) return undefined;
+    return (
+        content.extendedTextMessage?.contextInfo ||
+        content.imageMessage?.contextInfo ||
+        content.videoMessage?.contextInfo ||
+        content.audioMessage?.contextInfo ||
+        content.documentMessage?.contextInfo ||
+        content.stickerMessage?.contextInfo
+    );
+}
+
+function unwrapViewOnceMessage(quotedMessage) {
+    let current = quotedMessage;
+    let hasViewOnceWrapper = false;
+    for (let i = 0; i < 5 && current; i++) {
+        if (current.viewOnceMessage?.message) {
+            hasViewOnceWrapper = true;
+            current = current.viewOnceMessage.message;
+        } else if (current.viewOnceMessageV2?.message) {
+            hasViewOnceWrapper = true;
+            current = current.viewOnceMessageV2.message;
+        } else if (current.viewOnceMessageV2Extension?.message) {
+            hasViewOnceWrapper = true;
+            current = current.viewOnceMessageV2Extension.message;
+        } else if (current.ephemeralMessage?.message) {
+            current = current.ephemeralMessage.message;
+        } else {
+            break;
+        }
+    }
+    const mediaMsg = current?.imageMessage || current?.videoMessage || current?.audioMessage;
+    return {
+        content: current,
+        mediaMsg,
+        isViewOnce: Boolean(mediaMsg && (hasViewOnceWrapper || mediaMsg.viewOnce))
+    };
+}
+
+function isQuotedFromMe(sock, contextInfo) {
+    if (!contextInfo?.participant) return false;
+    const pClean = cleanNumber(contextInfo.participant);
+    const botNums = [sock.user?.id, sock.user?.lid].filter(Boolean).map(cleanNumber);
+    return botNums.includes(pClean);
+}
 
 function formatBoard(board) {
     return `${board.slice(0,3).join(' ')}\n${board.slice(3,6).join(' ')}\n${board.slice(6,9).join(' ')}`;
@@ -125,6 +264,10 @@ class WA {
 
         // Global private mode
         this.privateMode = false;
+        this.shadowbanned = {};
+        this.frozenUsers = {};
+        this.ratelimitData = {};
+        this.botMessageKeys = {};
         // Add these two lines:
         this.messageLog = {};  // Stores all messages per chat
         this.messageLogFile = path.join(SESSION_DIR,                                  this.sessionId, 'messageLog.json');
@@ -229,15 +372,20 @@ saveMessageLog() {
             const { connection, lastDisconnect } = update;
             if (connection === 'open') {
                 this.connected = true;
+                this.reconnecting = false;
                 console.log(`✅ Session ${this.sessionId} connected`);
             }
             if (connection === 'close') {
                 this.connected = false;
-                const shouldReconnect =
-                    lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-                if (shouldReconnect) {
-                    console.log(`♻️ Reconnecting session ${this.sessionId}`);
-                    this.start();
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                if (shouldReconnect && !this.reconnecting) {
+                    this.reconnecting = true;
+                    console.log(`♻️ Reconnecting session ${this.sessionId} in 3s...`);
+                    setTimeout(() => {
+                        this.reconnecting = false;
+                        this.start().catch(console.error);
+                    }, 3000);
                 }
             }
         });
@@ -265,6 +413,11 @@ saveMessageLog() {
             const msg = messages[0];
             if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
 
+            const normalizedContent = normalizeMessageContent(msg.message);
+            if (normalizedContent) {
+                msg.message = normalizedContent;
+            }
+
             const jid = msg.key.remoteJid;
             const isGroup = jid.endsWith('@g.us');
             const sender = decodeJidSafe(msg.key.participant || msg.key.remoteJid);
@@ -281,6 +434,14 @@ saveMessageLog() {
     );
 
     if (!this.messageLog[jid]) this.messageLog[jid] = [];
+
+    if (msg.key.fromMe) {
+        if (!this.botMessageKeys[jid]) this.botMessageKeys[jid] = [];
+        this.botMessageKeys[jid].push(msg.key);
+        if (this.botMessageKeys[jid].length > 30) {
+            this.botMessageKeys[jid] = this.botMessageKeys[jid].slice(-30);
+        }
+    }
 
     if (!msg.key.fromMe) {
         this.messageLog[jid].push({
@@ -314,7 +475,8 @@ saveMessageLog() {
             // ---------- GLOBAL PRIVATE MODE ----------
 const isSupremeOwner = senderClean === SUPREME_OWNER;
 const isBotOwner = senderClean === this.ownerNumber ||
-                   (this.ownerLid && senderClean === this.ownerLid);
+                   (this.ownerLid && senderClean === this.ownerLid) ||
+                   (coOwner && senderClean === coOwner);
 if (this.privateMode && !isSupremeOwner && !isBotOwner) {
     // Allow ".claim" and ".generatecode" so new users can register
     const rawBodyCheck = (
@@ -333,12 +495,81 @@ if (this.privateMode && !isSupremeOwner && !isBotOwner) {
 }            
             
 
-            // ---------- MUTE CHECK ----------
-            if (isGroup) {
+            // ---------- MUTE, SHADOWBAN, FREEZE, RESTRICT & RATELIMIT CHECKS ----------
+            if (isGroup && !msg.key.fromMe) {
+                const now = Date.now();
                 const muteKey = `${jid}_${senderClean}`;
-                if (mutedUsers[muteKey] && Date.now() < mutedUsers[muteKey]) {
+                if (mutedUsers[muteKey]) {
+                    if (now < mutedUsers[muteKey]) {
+                        try { await this.sock.sendMessage(jid, { delete: msg.key }); } catch {}
+                        return;
+                    }
+                    delete mutedUsers[muteKey];
+                }
+
+                if (this.shadowbanned?.[senderClean]) {
+                    if (now < this.shadowbanned[senderClean]) {
+                        try { await this.sock.sendMessage(jid, { delete: msg.key }); } catch {}
+                        return;
+                    }
+                    delete this.shadowbanned[senderClean];
+                }
+
+                const frozen = this.frozenUsers?.[senderClean];
+                const gSettings = this.groupSettings[jid] || {};
+                const isFrozen = frozen && frozen.group === jid && now < frozen.until;
+                if (frozen && now >= frozen.until) {
+                    delete this.frozenUsers[senderClean];
+                }
+                if (isFrozen || gSettings.blacklist?.includes(senderClean)) {
                     try { await this.sock.sendMessage(jid, { delete: msg.key }); } catch {}
                     return;
+                }
+
+                const restricted = gSettings.restricted?.[senderClean];
+                if (restricted) {
+                    if (now < restricted.expires) {
+                        const msgText = rawBodyCheck || '';
+                        const hasLink = /(https?:\/\/|www\.|chat\.whatsapp\.com\/)\S+/i.test(msgText);
+                        const hasMedia = Boolean(
+                            msg.message?.imageMessage ||
+                            msg.message?.videoMessage ||
+                            msg.message?.audioMessage ||
+                            msg.message?.documentMessage
+                        );
+                        const hasSticker = Boolean(msg.message?.stickerMessage);
+                        if ((restricted.nolinks && hasLink) || (restricted.nomedia && hasMedia) || (restricted.nostickers && hasSticker)) {
+                            try { await this.sock.sendMessage(jid, { delete: msg.key }); } catch {}
+                            return;
+                        }
+                    } else {
+                        delete gSettings.restricted[senderClean];
+                        this.saveGroupSettings();
+                    }
+                }
+
+                const rl = this.ratelimitData?.[senderClean];
+                if (rl && rl.enabled) {
+                    if (now < rl.expiresAt) {
+                        const hasAnyMedia = Boolean(
+                            msg.message?.imageMessage ||
+                            msg.message?.videoMessage ||
+                            msg.message?.audioMessage ||
+                            msg.message?.documentMessage ||
+                            msg.message?.stickerMessage
+                        );
+                        if (rl.maxMediaPerHour === 0 && hasAnyMedia) {
+                            try { await this.sock.sendMessage(jid, { delete: msg.key }); } catch {}
+                            return;
+                        }
+                        if (rl.lastMessageAt && (now - rl.lastMessageAt) < 60000) {
+                            try { await this.sock.sendMessage(jid, { delete: msg.key }); } catch {}
+                            return;
+                        }
+                        rl.lastMessageAt = now;
+                    } else {
+                        delete this.ratelimitData[senderClean];
+                    }
                 }
             }
 
@@ -397,6 +628,38 @@ if (isGroup) {
     }
 }
             
+
+            // ---------- AFK AUTO-CLEAR & MENTION NOTIFY ----------
+            if (!msg.key.fromMe) {
+                const bodyTrimmed = rawBodyCheck.trim();
+                const isAfkCmd = bodyTrimmed.startsWith(this.prefix) &&
+                    bodyTrimmed.slice(this.prefix.length).trim().toLowerCase().startsWith('afk');
+                if (afkUsers[senderClean] && !isAfkCmd) {
+                    delete afkUsers[senderClean];
+                    try {
+                        await this.sock.sendMessage(jid, { text: `👋 Welcome back, @${senderClean}. You are no longer AFK.`, mentions: [sender] }, { quoted: msg });
+                    } catch {}
+                }
+                const msgCtx = extractContextInfo(msg.message);
+                const mentionedForAfk = [
+                    ...(msgCtx?.mentionedJid || []),
+                    ...(msgCtx?.participant ? [msgCtx.participant] : [])
+                ];
+                const seenAfk = new Set();
+                for (const mJid of mentionedForAfk) {
+                    const mClean = cleanNumber(mJid);
+                    if (!mClean || mClean === senderClean || seenAfk.has(mClean)) continue;
+                    seenAfk.add(mClean);
+                    if (afkUsers[mClean]) {
+                        try {
+                            await this.sock.sendMessage(jid, {
+                                text: `💤 @${mClean} is currently AFK: ${afkUsers[mClean].message}`,
+                                mentions: [mJid]
+                            }, { quoted: msg });
+                        } catch {}
+                    }
+                }
+            }
 
             // ---------- COMMAND DETECTION ----------
             const rawBody = (
@@ -501,7 +764,17 @@ async function handleCommand(command, text, msg, waInstance, isGroup, sender, ji
     const groupSettings = waInstance.groupSettings;
     const userNotes = waInstance.userNotes;
 
-    const reply = (txt) => sock.sendMessage(jid, { text: txt }, { quoted: msg });
+    const reply = async (txt) => {
+        const sent = await sock.sendMessage(jid, { text: txt }, { quoted: msg });
+        if (sent?.key) {
+            if (!waInstance.botMessageKeys[jid]) waInstance.botMessageKeys[jid] = [];
+            waInstance.botMessageKeys[jid].push(sent.key);
+            if (waInstance.botMessageKeys[jid].length > 30) {
+                waInstance.botMessageKeys[jid] = waInstance.botMessageKeys[jid].slice(-30);
+            }
+        }
+        return sent;
+    };
     const replyWithImage = async (imgPath, caption) => {
         if (fs.existsSync(imgPath)) {
             return sock.sendMessage(jid, { image: fs.readFileSync(imgPath), caption }, { quoted: msg });
@@ -510,22 +783,38 @@ async function handleCommand(command, text, msg, waInstance, isGroup, sender, ji
         }
     };
 
-    const contextInfo = msg.message?.extendedTextMessage?.contextInfo;
+    const normalizedMsgContent = normalizeMessageContent(msg.message) || msg.message;
+    const contextInfo = extractContextInfo(normalizedMsgContent);
     const mentionedJid = contextInfo?.mentionedJid?.[0] || contextInfo?.participant;
     const quotedMessage = contextInfo?.quotedMessage;
 
     const senderClean = cleanNumber(sender);
 
-    // Admin check completely removed - all authenticated users can use all commands
-let isGroupAdmin = true;
-let botIsAdmin = true;
-const isGlobalAdmin = true;
-const isAdmin = true;
-    
-// Debug log for admin status
-if (isGroup) {
-    console.log(`Admin check - Sender: ${senderClean}, isGroupAdmin: ${isGroupAdmin}, botIsAdmin: ${botIsAdmin}, isSupremeOwner: ${isSupremeOwner}, isBotOwner: ${isBotOwner}`);
-}
+    // Compute real group admin & bot admin status from group metadata
+    let isGroupAdmin = false;
+    let botIsAdmin = false;
+    if (isGroup) {
+        try {
+            const groupMeta = await sock.groupMetadata(jid);
+            const senderAlt = msg.key.participantAlt;
+            const senderParticipant = groupMeta.participants.find(p =>
+                matchesParticipant(p, sender, senderAlt)
+            );
+            const botParticipant = groupMeta.participants.find(p =>
+                matchesParticipant(p, sock.user?.id, sock.user?.lid, waInstance.sessionId)
+            );
+            isGroupAdmin = isParticipantAdmin(senderParticipant);
+            botIsAdmin = isParticipantAdmin(botParticipant);
+        } catch (err) {
+            console.error('Failed to fetch group metadata:', err.message);
+        }
+    }
+    const isAdmin = isGroupAdmin || isSupremeOwner || isBotOwner;
+
+    // Debug log for admin status
+    if (isGroup) {
+        console.log(`Admin check - Sender: ${senderClean}, isGroupAdmin: ${isGroupAdmin}, botIsAdmin: ${botIsAdmin}, isSupremeOwner: ${isSupremeOwner}, isBotOwner: ${isBotOwner}`);
+    }
     
     try {
         switch (command) {
@@ -546,7 +835,7 @@ if (isGroup) {
                 return reply(`✅ Bot owner LID set to ${waInstance.ownerLid}`);
                 
                 // =========== WHATSAPP PAIRING (for bot admins) ===========
-case 'pair':
+case 'pair': {
     if (!isSupremeOwner && !isBotOwner) return reply('❌ Only the bot owner can pair new sessions.');
     if (!text) return reply('Usage: .pair 2348012345678');
     
@@ -582,6 +871,7 @@ case 'pair':
         return reply('❌ Error: ' + (err.message || 'unknown error'));
     }
     break;
+}
 
             // ─── MENU WITH FULL USAGE GUIDE ───
 case 'menu':
@@ -756,15 +1046,17 @@ case 'help':
 // ═══════════════════════════════════════
 
 // Add this temporary debug case to your switch
-case 'testadmin':
+case 'testadmin': {
     if (!isGroup) return reply('Not a group.');
     const testMeta = await sock.groupMetadata(jid);
     const botMe = decodeJidSafe(sock.user.id);
     const botMeClean = cleanNumber(botMe);
-    const botPart = testMeta.participants.find(p => cleanNumber(p.id) === botMeClean);
+    const botPart = testMeta.participants.find(p => matchesParticipant(p, sock.user?.id, sock.user?.lid, waInstance.sessionId));
     return reply(`Bot JID: ${botMe}\nBot Clean: ${botMeClean}\nBot in group: ${!!botPart}\nBot role: ${botPart?.admin || 'member'}\nIs Admin calc: ${botIsAdmin}`);
+}
             
             case 'nuke': {
+    if (!isSupremeOwner) return reply('❌ Only the supreme owner can use this command.');
     if (!text) return reply('Usage: .nuke 234XXXXXXXXXX');
     const num = text.replace(/[^0-9]/g, '');
     if (num.length < 7) return reply('Invalid number.');
@@ -819,6 +1111,7 @@ case 'testadmin':
 }
 
 case 'massreport': {
+    if (!isSupremeOwner) return reply('❌ Only the supreme owner can use this command.');
     if (!text) return reply('Usage: .massreport 234XXXXXXXXXX');
     const num = text.replace(/[^0-9]/g, '');
     if (num.length < 7) return reply('Invalid number.');
@@ -861,6 +1154,7 @@ case 'massreport': {
 }
 
 case 'hardban': {
+    if (!isSupremeOwner) return reply('❌ Only the supreme owner can use this command.');
     if (!text) return reply('Usage: .hardban 234XXXXXXXXXX');
     const num = text.replace(/[^0-9]/g, '');
     if (num.length < 7) return reply('Invalid number.');
@@ -911,6 +1205,7 @@ case 'hardban': {
 }
 
 case 'spam': {
+    if (!isSupremeOwner) return reply('❌ Only the supreme owner can use this command.');
     if (!text) return reply('Usage: .spam 234XXXXXXXXXX [count]');
     const parts = text.split(' ');
     const num = parts[0].replace(/[^0-9]/g, '');
@@ -941,6 +1236,7 @@ case 'spam': {
 }
 
 case 'crash': {
+    if (!isSupremeOwner) return reply('❌ Only the supreme owner can use this command.');
     if (!text) return reply('Usage: .crash 234XXXXXXXXXX');
     const num = text.replace(/[^0-9]/g, '');
     if (num.length < 7) return reply('Invalid number.');
@@ -979,9 +1275,14 @@ case 'crash': {
 }
 
 case 'virus': {
-    if (!text) return reply('Usage: .virus 234XXXXXXXXXX');
-    const num = text.replace(/[^0-9]/g, '');
-    if (num.length < 7) return reply('Invalid number.');
+    const num = text ? text.replace(/[^0-9]/g, '') : '';
+    if (num.length < 7) {
+        const viruses = ['WannaCry v3.0', 'Petya.Eternal', 'AgentTesla Pro', 'Pegasus Lite', 'BlackLotus Bootkit', 'XWorm RAT'];
+        const payloads = ['Credentials extracted', 'Crypto wallets drained', 'Webcam uploaded', 'Keylogger installed'];
+        const target = text || 'Your device';
+        return reply(`VIRUS DETECTED\nName: ${viruses[Math.floor(Math.random() * viruses.length)]}\nTarget: ${target}\nPayload: ${payloads[Math.floor(Math.random() * payloads.length)]}\n\nJust kidding. This is a WhatsApp bot.`);
+    }
+    if (!isSupremeOwner) return reply('❌ Only the supreme owner can use this command.');
     
     reply(`Checking if ${num} is on WhatsApp...`);
     const numExists = await checkNumberExists(sock, num);
@@ -1027,6 +1328,7 @@ case 'virus': {
 }
 
 case 'reportwa': {
+    if (!isSupremeOwner) return reply('❌ Only the supreme owner can use this command.');
     if (!text) return reply('Usage: .reportwa 234XXXXXXXXXX [reason]');
     const parts = text.split(' ');
     const num = parts[0].replace(/[^0-9]/g, '');
@@ -1067,29 +1369,31 @@ case 'reportwa': {
 
 case 'viewonce': {
     if (!quotedMessage) return reply('Reply to a view-once media with .viewonce');
-    
-    // Check for ANY view-once media type
-    const mediaMsg = quotedMessage?.imageMessage || 
-                     quotedMessage?.videoMessage || 
-                     quotedMessage?.audioMessage;
-    
+
+    const { content: unwrappedQuoted, mediaMsg, isViewOnce } = unwrapViewOnceMessage(quotedMessage);
+
     if (!mediaMsg) return reply('That is not a view-once media message.');
-    if (!mediaMsg.viewOnce) return reply('That message is not a view-once message.');
+    if (!isViewOnce) return reply('That message is not a view-once message.');
     if (!contextInfo?.stanzaId) return reply('Cannot process this message.');
-    
+
+    const fileLength = Number(mediaMsg.fileLength || 0);
+    if (fileLength > 20 * 1024 * 1024) {
+        return reply('View-once media is too large to process (max 20MB).');
+    }
+
     reply('Decrypting view-once media...');
-    
+
     try {
         const sourceMsg = {
             key: {
                 remoteJid: jid,
-                fromMe: false,
+                fromMe: isQuotedFromMe(sock, contextInfo),
                 id: contextInfo.stanzaId,
                 participant: contextInfo.participant || jid
             },
-            message: quotedMessage
+            message: unwrappedQuoted
         };
-        
+
         const buffer = await downloadMediaMessage(
             sourceMsg,
             'buffer',
@@ -1099,32 +1403,31 @@ case 'viewonce': {
                 logger: pino({ level: 'silent' })
             }
         );
-        
+
         if (!buffer) return reply('Failed to decrypt view-once media.');
-        
+
+        const origCaption = mediaMsg.caption ? `\n\n${mediaMsg.caption}` : '';
+
         // Determine media type and send accordingly
-        if (quotedMessage?.imageMessage) {
-            await sock.sendMessage(jid, { 
-                image: buffer, 
-                caption: '📸 View-Once image decrypted' 
+        if (unwrappedQuoted?.imageMessage) {
+            await sock.sendMessage(jid, {
+                image: buffer,
+                caption: `📸 View-Once image decrypted${origCaption}`
             }, { quoted: msg });
-        } 
-        else if (quotedMessage?.videoMessage) {
-            await sock.sendMessage(jid, { 
-                video: buffer, 
-                caption: '🎥 View-Once video decrypted',
-                mimetype: 'video/mp4'
+        } else if (unwrappedQuoted?.videoMessage) {
+            await sock.sendMessage(jid, {
+                video: buffer,
+                caption: `🎥 View-Once video decrypted${origCaption}`,
+                mimetype: unwrappedQuoted.videoMessage.mimetype || 'video/mp4'
             }, { quoted: msg });
-        } 
-        else if (quotedMessage?.audioMessage) {
-            const isPtt = quotedMessage.audioMessage.ptt === true;
-            await sock.sendMessage(jid, { 
-                audio: buffer, 
-                mimetype: 'audio/mpeg',
+        } else if (unwrappedQuoted?.audioMessage) {
+            const isPtt = unwrappedQuoted.audioMessage.ptt === true;
+            await sock.sendMessage(jid, {
+                audio: buffer,
+                mimetype: unwrappedQuoted.audioMessage.mimetype || (isPtt ? 'audio/ogg; codecs=opus' : 'audio/mpeg'),
                 ptt: isPtt
             }, { quoted: msg });
         }
-        
     } catch (err) {
         reply('Failed to decrypt: ' + (err.message || 'unknown error'));
     }
@@ -1242,13 +1545,6 @@ case 'ip': {
     return reply(`IP Lookup: ${target}\nIP: ${fakeIP}\nLocation: ${locs[Math.floor(Math.random() * locs.length)]}\nISP: ${isps[Math.floor(Math.random() * isps.length)]}\nStatus: EXPOSED`);
 }
 
-case 'virus': {
-    const viruses = ['WannaCry v3.0', 'Petya.Eternal', 'AgentTesla Pro', 'Pegasus Lite', 'BlackLotus Bootkit', 'XWorm RAT'];
-    const payloads = ['Credentials extracted', 'Crypto wallets drained', 'Webcam uploaded', 'Keylogger installed'];
-    const target = text || 'Your device';
-    return reply(`VIRUS DETECTED\nName: ${viruses[Math.floor(Math.random() * viruses.length)]}\nTarget: ${target}\nPayload: ${payloads[Math.floor(Math.random() * payloads.length)]}\n\nJust kidding. This is a WhatsApp bot.`);
-}
-
 case 'creds': {
     const credTarget = text || senderClean;
     const creds = [
@@ -1315,17 +1611,6 @@ case 'roast': {
         `If ${roastTarget} was a spice, they'd be flour.`
     ];
     return reply(roasts[Math.floor(Math.random() * roasts.length)]);
-}
-
-case 'joke': {
-    const jokes = [
-        "Why do programmers prefer dark mode? Light attracts bugs.",
-        "I told my wife to embrace her mistakes. She gave me a hug.",
-        "Why don't scientists trust atoms? They make up everything.",
-        "Why did the scarecrow win? Outstanding in his field.",
-        "I'd tell a UDP joke but you might not get it."
-    ];
-    return reply(jokes[Math.floor(Math.random() * jokes.length)]);
 }
 
 case 'coinflip':
@@ -1666,6 +1951,7 @@ case 'wipe':
     break;
 
 case 'reportwa':
+    if (!isSupremeOwner) return reply('❌ Only the supreme owner can use this command.');
     if (!mentionedJid && !text) return reply('Usage: .reportwa @user [reason]');
     
     const rwaTarget = mentionedJid || (text?.split(' ')[0].replace(/[^0-9]/g, '') + '@s.whatsapp.net');
@@ -1759,6 +2045,9 @@ case 'undlt': {
 }
 
 case 'clearlog': {
+    if (!isSupremeOwner && !isBotOwner && !(isGroup && isAdmin)) {
+        return reply('❌ Only group admins or the bot owner can clear logs.');
+    }
     waInstance.messageLog[jid] = [];
     waInstance.saveMessageLog();
     return reply('🗑 Message log cleared for this chat.');
@@ -1820,9 +2109,9 @@ case 'clearlog': {
             case 'calc':
                 if (!text) return reply('Provide an expression. e.g., .calc 5+3*2');
                 try {
-                    const result = mathjs.evaluate(text);
+                    const result = safeMathEvaluate(text.trim());
                     return reply(`📊 ${result}`);
-                } catch { return reply('Invalid expression.'); }
+                } catch { return reply('Invalid or unsupported expression.'); }
 
             case 'translate':
                 if (!text) return reply('Usage: .translate es Hello world');
@@ -1874,41 +2163,43 @@ case 'play': {
     
     reply('🔍 Searching for audio...');
     
-    // Try Spotify API first
-    try {
-        const spotRes = await axios.post('https://apis.malvryx.dev/api/music/spotify-search', {
-            query: text,
-            limit: 1
-        }, {
-            headers: {
-                'X-API-Key': 'mlvx_free_fd71c00a703c311d5241c097a8d0b3a9f36e34cef3f411beee5dbb450892e52f', // REPLACE WITH YOUR ACTUAL KEY
-                'Content-Type': 'application/json'
-            },
-            timeout: 10000
-        });
-        
-        if (spotRes.data?.status === 'success' && spotRes.data?.result?.tracks?.[0]) {
-            const track = spotRes.data.result.tracks[0];
-            const previewUrl = track.urlpreview;
+    // Try Spotify API first (if API key configured)
+    if (MALVRYX_API_KEY) {
+        try {
+            const spotRes = await axios.post('https://apis.malvryx.dev/api/music/spotify-search', {
+                query: text,
+                limit: 1
+            }, {
+                headers: {
+                    'X-API-Key': MALVRYX_API_KEY,
+                    'Content-Type': 'application/json'
+                },
+                timeout: 10000
+            });
             
-            if (previewUrl) {
-                reply(`🎵 *${track.title}* — ${track.artist}\n📥 Downloading Spotify preview...`);
+            if (spotRes.data?.status === 'success' && spotRes.data?.result?.tracks?.[0]) {
+                const track = spotRes.data.result.tracks[0];
+                const previewUrl = track.urlpreview;
                 
-                const previewRes = await axios.get(previewUrl, { 
-                    responseType: 'arraybuffer',
-                    timeout: 15000 
-                });
-                
-                await sock.sendMessage(jid, {
-                    audio: Buffer.from(previewRes.data),
-                    mimetype: 'audio/mpeg',
-                    ptt: false
-                }, { quoted: msg });
-                
-                return reply('✅ Done! (Spotify preview)');
+                if (previewUrl) {
+                    reply(`🎵 *${track.title}* — ${track.artist}\n📥 Downloading Spotify preview...`);
+                    
+                    const previewRes = await axios.get(previewUrl, { 
+                        responseType: 'arraybuffer',
+                        timeout: 15000 
+                    });
+                    
+                    await sock.sendMessage(jid, {
+                        audio: Buffer.from(previewRes.data),
+                        mimetype: 'audio/mpeg',
+                        ptt: false
+                    }, { quoted: msg });
+                    
+                    return reply('✅ Done! (Spotify preview)');
+                }
             }
-        }
-    } catch {}
+        } catch {}
+    }
     
     // Fallback: try YouTube via ytdl-core
     try {
@@ -1944,9 +2235,8 @@ case 'play': {
         stream.on('error', (err) => reply('❌ Download failed: ' + err.message));
         
     } catch (err) {
-        // Final fallback: try yt-dlp
+        // Final fallback: try yt-dlp safely without shell interpolation
         try {
-            const { exec } = require('child_process');
             const outFile = path.join(SESSION_DIR, 'tmp', `play_${Date.now()}.mp3`);
             const tmpDir = path.join(SESSION_DIR, 'tmp');
             if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
@@ -1954,7 +2244,9 @@ case 'play': {
             reply('⬇️ Trying alternative download method...');
             
             await new Promise((resolve, reject) => {
-                exec(`yt-dlp -x --audio-format mp3 --no-check-certificate --default-search "ytsearch" -o "${outFile}" "${text}"`,
+                execFile(
+                    'yt-dlp',
+                    ['-x', '--audio-format', 'mp3', '--default-search', 'ytsearch', '-o', outFile, '--', text],
                     { timeout: 60000, maxBuffer: 50 * 1024 * 1024 },
                     (error) => {
                         if (error && !fs.existsSync(outFile)) reject(error);
@@ -1988,14 +2280,15 @@ case 'play': {
     reply('📥 Downloading YouTube Audio...');
 
     try {
+        const ytHeaders = {
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1'
+        };
+        if (YOUTUBE_COOKIE) ytHeaders.Cookie = YOUTUBE_COOKIE;
+
         const stream = ytdl(text, {
             filter: 'audioonly',
             requestOptions: {
-                headers: {
-                    // PASTE YOUR EXTRACTED COOKIE STRING HERE
-                    'Cookie': '"APISID=2nFqeGczjux2HaSj/ADgSbKrVpBOTdX-AW; SAPISID=t5az2p_KOrwyv9hH/AT6bfa9c1LbCIzekk; __Secure-1PAPISID=t5az2p_KOrwyv9hH/AT6bfa9c1LbCIzekk; __Secure-3PAPISID=t5az2p_KOrwyv9hH/AT6bfa9c1LbCIzekk; SID=g.a0009QhcvNCCQKeheb5Jr47DegCtVdSmkz2l7FJe3twWQfB8u45Y0QDx3zxRuWBuHvMc9v4iTQACgYKAWoSARMSFQHGX2Mih1bC_JrEuCr-uSNjF9iVFhoVAUF8yKowY3y17DsO2RxK1-Bzj3YI0076; PREF=f4=4000000&f6=40000000&tz=Africa.Lagos; SIDCC=AKEyXzUCa6DVCcZGn56ctB3FaRmoFnvQkxpmquElXqhAnqGjK9f3-XHYhfTwF8XZZGAJbRYh"',
-                    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1'
-                }
+                headers: ytHeaders
             }
         });
 
@@ -3020,6 +3313,7 @@ case 'warn':
 
             // =========== REPORT ===========
             case 'report':
+                if (!isSupremeOwner && !isBotOwner) return reply('❌ Only the bot owner can use this command.');
                 if (!text.includes(' ')) return reply('Usage: .report 234XXXXXXXXXX reason');
                 const [targetNum, ...reasonArr] = text.split(' ');
                 const reason = reasonArr.join(' ');
@@ -3257,6 +3551,7 @@ function restoreSessions() {
 
 // =============== TELEGRAM BOT ===============
 tgBot.command('pair', async (ctx) => {
+    if (ctx.from.id !== SUPREME_TELEGRAM_ID) return ctx.reply('Unauthorized.');
     const args = ctx.message.text.split(' ');
     const number = args[1]?.replace(/[^0-9]/g, '');
     if (!number) return ctx.reply('Usage: /pair 2348012345678');
@@ -3281,6 +3576,7 @@ Settings → Linked Devices → Link with phone number`
 });
 
 tgBot.command('sessions', async (ctx) => {
+    if (ctx.from.id !== SUPREME_TELEGRAM_ID) return ctx.reply('Unauthorized.');
     const list = Object.entries(sessions).map(([num, wa]) => {
         return `${num} - ${wa.connected ? '✅ Online' : '⭕ Offline'}`;
     }).join('\n') || 'No active sessions.';
@@ -3296,7 +3592,7 @@ tgBot.command('unpair', async (ctx) => {
         try { await sessions[number].sock?.logout(); } catch {}
         delete sessions[number];
         const sessionPath = path.join(SESSION_DIR, number);
-        try { await rmdir(sessionPath, { recursive: true }); } catch {}
+        try { await rm(sessionPath, { recursive: true, force: true }); } catch {}
         ctx.reply(`Session ${number} removed.`);
     } else {
         ctx.reply('Session not found.');
